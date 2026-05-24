@@ -2,7 +2,9 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
+from threading import Lock
 
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -21,6 +23,8 @@ from errors import (
     MODEL_UNAVAILABLE,
     PARSE_FAILED,
     QUOTA_EXCEEDED,
+    RATE_LIMITED,
+    RESPONSE_TRUNCATED,
     UPSTREAM_TIMEOUT,
     ApiError,
 )
@@ -29,8 +33,17 @@ load_dotenv()
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
-FALLBACK_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b")
+# One model = one Gemini call per click (free tier ~5 RPM).
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
+ENABLE_MODEL_FALLBACK = os.getenv("GEMINI_ENABLE_FALLBACK", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "12"))
+_last_gemini_by_client: dict[str, float] = {}
+_gemini_interval_lock = Lock()
 
 app = Flask(__name__, static_folder=str(FRONTEND_DIR), static_url_path="")
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -79,9 +92,14 @@ def _parse_questions(text: str | None) -> list[str]:
 
 
 def _models_to_try() -> list[str]:
+    """Return models to call. Default is a single model to respect free-tier RPM (5/min)."""
+    primary = GEMINI_MODEL or "gemini-2.5-flash"
+    if not ENABLE_MODEL_FALLBACK:
+        return [primary]
+
     seen: set[str] = set()
     ordered: list[str] = []
-    for name in (GEMINI_MODEL, *FALLBACK_MODELS):
+    for name in (primary, *FALLBACK_MODELS):
         if name and name not in seen:
             seen.add(name)
             ordered.append(name)
@@ -121,14 +139,19 @@ Requirements:
 - Each question should probe real skills, judgment, or experience relevant to the role
 - Avoid generic questions like "tell me about yourself" or "what are your strengths"
 - Vary the focus (e.g. technical depth, collaboration, trade-offs, past impact)
+- Each question must be under 220 characters (concise but specific)
 - Questions should be answerable in a 3–5 minute response
 
-Return ONLY valid JSON in this exact shape, with no markdown or extra text:
+Return JSON only in this exact shape:
 {{"questions": ["question 1", "question 2", "question 3"]}}"""
 
     response = model.generate_content(
         prompt,
-        generation_config={"temperature": 0.7, "max_output_tokens": 1024},
+        generation_config={
+            "temperature": 0.7,
+            "max_output_tokens": 2048,
+            "response_mime_type": "application/json",
+        },
     )
 
     if not response.candidates:
@@ -143,21 +166,61 @@ Return ONLY valid JSON in this exact shape, with no markdown or extra text:
     finish_name = finish.name if hasattr(finish, "name") else str(finish)
     if finish_name in ("SAFETY", "RECITATION", "BLOCKLIST"):
         raise ValueError(f"blocked:{finish_name}")
+    if "MAX_TOKENS" in finish_name:
+        raise ValueError("truncated:max_tokens")
 
     text = response.text
     return _parse_questions(text)
+
+
+def _enforce_client_interval() -> None:
+    if GEMINI_MIN_INTERVAL_SEC <= 0:
+        return
+    client = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "local")
+        .split(",")[0]
+        .strip()
+    )
+    now = time.monotonic()
+    with _gemini_interval_lock:
+        last = _last_gemini_by_client.get(client, 0.0)
+        elapsed = now - last
+        if elapsed < GEMINI_MIN_INTERVAL_SEC:
+            wait = int(GEMINI_MIN_INTERVAL_SEC - elapsed) + 1
+            raise ApiErrorException(
+                ApiError(
+                    code=RATE_LIMITED.code,
+                    message=f"Please wait {wait} seconds before trying again.",
+                    hint=RATE_LIMITED.hint,
+                    http_status=RATE_LIMITED.http_status,
+                )
+            )
+        _last_gemini_by_client[client] = now
 
 
 def _generate_questions(job_title: str) -> list[str]:
     if not GEMINI_API_KEY:
         raise ApiErrorException(MISSING_API_KEY)
 
-    last_error: Exception | None = None
+    _enforce_client_interval()
     models = _models_to_try()
+
+    # Never burn multiple RPM on quota/auth errors — fail immediately.
+    no_retry_codes = {
+        QUOTA_EXCEEDED.code,
+        INVALID_API_KEY.code,
+        MISSING_API_KEY.code,
+        CONTENT_BLOCKED.code,
+    }
 
     for model_name in models:
         try:
-            logger.info("Generating questions for %r using %s", job_title, model_name)
+            logger.info(
+                "Gemini call 1/%d for %r (model=%s)",
+                len(models),
+                job_title,
+                model_name,
+            )
             return _generate_with_model(model_name, job_title)
         except ApiErrorException:
             raise
@@ -165,18 +228,24 @@ def _generate_questions(job_title: str) -> list[str]:
             msg = str(exc)
             if msg.startswith("blocked:"):
                 raise ApiErrorException(CONTENT_BLOCKED) from exc
-            last_error = exc
+            if msg.startswith("truncated:"):
+                raise ApiErrorException(RESPONSE_TRUNCATED) from exc
+            # Do not call another model on parse failure — that triples API usage.
             logger.warning("Parse failed for model %s: %s", model_name, exc)
+            raise ApiErrorException(PARSE_FAILED) from exc
         except Exception as exc:
             mapped = _map_gemini_exception(exc)
-            if mapped.code == MODEL_UNAVAILABLE.code and model_name != models[-1]:
+            if mapped.code in no_retry_codes:
+                raise ApiErrorException(mapped) from exc
+            if (
+                ENABLE_MODEL_FALLBACK
+                and mapped.code == MODEL_UNAVAILABLE.code
+                and model_name != models[-1]
+            ):
                 logger.warning("Model %s unavailable, trying fallback", model_name)
-                last_error = exc
                 continue
             raise ApiErrorException(mapped) from exc
 
-    if isinstance(last_error, ValueError):
-        raise ApiErrorException(PARSE_FAILED) from last_error
     raise ApiErrorException(GENERATION_FAILED)
 
 

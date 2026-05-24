@@ -64,7 +64,14 @@ INVALID_API_KEY = ApiError(
 QUOTA_EXCEEDED = ApiError(
     code="QUOTA_EXCEEDED",
     message="Gemini rate or usage limit reached.",
-    hint="Wait a minute and try again, or review quotas in Google AI Studio.",
+    hint="Free tier allows ~5 requests per minute. Wait 60 seconds, then try once.",
+    http_status=429,
+)
+
+RATE_LIMITED = ApiError(
+    code="RATE_LIMITED",
+    message="Please wait before generating again.",
+    hint="This app allows one Gemini request every 12 seconds to stay within free-tier limits.",
     http_status=429,
 )
 
@@ -94,7 +101,14 @@ UPSTREAM_TIMEOUT = ApiError(
 PARSE_FAILED = ApiError(
     code="PARSE_FAILED",
     message="Received an unexpected response from the AI service.",
-    hint="Try generating again. If this persists, switch GEMINI_MODEL in .env.",
+    hint="Try generating again. If this persists, set GEMINI_MODEL=gemini-2.5-flash in .env.",
+    http_status=502,
+)
+
+RESPONSE_TRUNCATED = ApiError(
+    code="RESPONSE_TRUNCATED",
+    message="The AI response was cut off before it finished.",
+    hint="Click Generate again — this is usually fixed automatically on retry.",
     http_status=502,
 )
 

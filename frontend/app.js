@@ -96,6 +96,7 @@ function friendlyTitle(code) {
     MISSING_API_KEY: "Service not configured",
     INVALID_API_KEY: "Invalid API key",
     QUOTA_EXCEEDED: "Rate limit reached",
+    RATE_LIMITED: "Please wait before trying again",
     MODEL_UNAVAILABLE: "Model unavailable",
     CONTENT_BLOCKED: "Input not accepted",
     UPSTREAM_TIMEOUT: "Request timed out",
@@ -173,6 +174,12 @@ function updateCharCount() {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+
+  // One Gemini call per click — ignore double-submit while loading.
+  if (submitBtn.disabled) {
+    return;
+  }
+
   clearError();
 
   const jobTitle = jobInput.value.trim();
@@ -195,7 +202,7 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
-  setLoading(true);
+  setLoading(true); // disable button before any async work
   resultsSection.hidden = true;
 
   try {
